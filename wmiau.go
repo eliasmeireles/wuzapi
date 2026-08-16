@@ -1431,8 +1431,14 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postmap["type"] = "HistorySync"
 		dowebhook = 1
 
-		// Save HistorySync messages to message_history table
-		if evt.Data != nil && evt.Data.Conversations != nil {
+		// Save HistorySync messages to message_history table only when the
+		// user's history setting is enabled (history > 0), matching the
+		// behaviour of the regular *events.Message path.
+		historySyncLimit := 0
+		if userinfo, found := userinfocache.Get(mycli.token); found {
+			historySyncLimit, _ = strconv.Atoi(userinfo.(Values).Get("History"))
+		}
+		if historySyncLimit > 0 && evt.Data != nil && evt.Data.Conversations != nil {
 			go func() {
 
 				// Get the account owner's JID for messages sent by the instance
