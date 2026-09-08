@@ -58,6 +58,7 @@ func (s *server) GetHealth() http.HandlerFunc {
 		MemoryStats       map[string]interface{} `json:"memory_stats"`
 		GoRoutines        int                    `json:"goroutines"`
 		Version           string                 `json:"version,omitempty"`
+		Instance          string                 `json:"instance,omitempty"`
 	}
 
 	startTime := time.Now()
@@ -112,6 +113,7 @@ func (s *server) GetHealth() http.HandlerFunc {
 			MemoryStats:       memoryStats,
 			GoRoutines:        runtime.NumGoroutine(),
 			Version:           version,
+			Instance:          currentInstance(),
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -210,6 +212,15 @@ func (s *server) authalice(next http.Handler) http.Handler {
 
 		if txtid == "" {
 			s.Respond(w, r, http.StatusUnauthorized, errors.New("unauthorized"))
+			return
+		}
+		// Refuse sessions that belong to a sibling instance sharing this
+		// database. Serving one would open a second whatsmeow socket for a
+		// device another process already holds, which WhatsApp answers by
+		// dropping both.
+		if owner := s.instanceOfToken(token); !ownsInstance(owner) {
+			log.Warn().Str("userID", txtid).Str("owner", owner).Str("instance", currentInstance()).Msg("Refusing request for a session owned by another instance")
+			s.Respond(w, r, http.StatusConflict, errors.New("session belongs to wuzapi instance "+owner))
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(ctx))
@@ -5649,6 +5660,7 @@ func (s *server) ListUsers() http.HandlerFunc {
 		WebhookUseProxy bool           `db:"webhook_use_proxy"`
 		Events          string         `db:"events"`
 		History         sql.NullInt64  `db:"history"`
+		Instance        sql.NullString `db:"instance"`
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		vars := mux.Vars(r)
@@ -5659,11 +5671,11 @@ func (s *server) ListUsers() http.HandlerFunc {
 
 		if hasID {
 			// Fetch a single user
-			query = "SELECT id, name, token, webhook, jid, qrcode, connected, expiration, proxy_url, COALESCE(webhook_use_proxy, true) AS webhook_use_proxy, events, history FROM users WHERE id = $1"
+			query = "SELECT id, name, token, webhook, jid, qrcode, connected, expiration, proxy_url, COALESCE(webhook_use_proxy, true) AS webhook_use_proxy, events, history, COALESCE(instance, '') AS instance FROM users WHERE id = $1"
 			args = append(args, userID)
 		} else {
 			// Fetch all users
-			query = "SELECT id, name, token, webhook, jid, qrcode, connected, expiration, proxy_url, COALESCE(webhook_use_proxy, true) AS webhook_use_proxy, events, history FROM users"
+			query = "SELECT id, name, token, webhook, jid, qrcode, connected, expiration, proxy_url, COALESCE(webhook_use_proxy, true) AS webhook_use_proxy, events, history, COALESCE(instance, '') AS instance FROM users"
 		}
 
 		rows, err := s.db.Queryx(query, args...)
@@ -5713,6 +5725,7 @@ func (s *server) ListUsers() http.HandlerFunc {
 				"expiration": user.Expiration.Int64,
 				"proxy_url":  user.ProxyURL.String,
 				"events":     user.Events,
+				"instance":   user.Instance.String,
 			}
 			// Add proxy_config
 			proxyURL := user.ProxyURL.String
@@ -5791,6 +5804,7 @@ func (s *server) AddUser() http.HandlerFunc {
 			S3Config    *S3Config    `json:"s3Config,omitempty"`
 			HmacKey     string       `json:"hmacKey,omitempty"`
 			History     int          `json:"history,omitempty"`
+			Instance    string       `json:"instance,omitempty"`
 		}
 
 		if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
@@ -5884,6 +5898,13 @@ func (s *server) AddUser() http.HandlerFunc {
 			}
 		}
 
+		// A user created without an explicit instance belongs to the process
+		// that created it: whoever pairs the device is the one holding its
+		// socket, so that is the only assignment that cannot be wrong.
+		if user.Instance == "" {
+			user.Instance = currentInstance()
+		}
+
 		// Generate ID
 		id, err := GenerateRandomID()
 		if err != nil {
@@ -5898,9 +5919,9 @@ func (s *server) AddUser() http.HandlerFunc {
 
 		// Insert user with all proxy, S3 and HMAC fields
 		if _, err = s.db.Exec(
-			"INSERT INTO users (id, name, token, webhook, expiration, events, jid, qrcode, proxy_url, webhook_use_proxy, s3_enabled, s3_endpoint, s3_region, s3_bucket, s3_access_key, s3_secret_key, s3_path_style, s3_public_url, media_delivery, s3_retention_days, hmac_key, history) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
+			"INSERT INTO users (id, name, token, webhook, expiration, events, jid, qrcode, proxy_url, webhook_use_proxy, s3_enabled, s3_endpoint, s3_region, s3_bucket, s3_access_key, s3_secret_key, s3_path_style, s3_public_url, media_delivery, s3_retention_days, hmac_key, history, instance) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)",
 			id, user.Name, user.Token, user.Webhook, user.Expiration, user.Events, "", "", user.ProxyConfig.ProxyURL, webhookUseProxy,
-			user.S3Config.Enabled, user.S3Config.Endpoint, user.S3Config.Region, user.S3Config.Bucket, user.S3Config.AccessKey, user.S3Config.SecretKey, user.S3Config.PathStyle, user.S3Config.PublicURL, user.S3Config.MediaDelivery, user.S3Config.RetentionDays, encryptedHmacKey, user.History,
+			user.S3Config.Enabled, user.S3Config.Endpoint, user.S3Config.Region, user.S3Config.Bucket, user.S3Config.AccessKey, user.S3Config.SecretKey, user.S3Config.PathStyle, user.S3Config.PublicURL, user.S3Config.MediaDelivery, user.S3Config.RetentionDays, encryptedHmacKey, user.History, user.Instance,
 		); err != nil {
 			log.Error().Str("error", fmt.Sprintf("%v", err)).Msg("admin DB error")
 			s.respondWithJSON(w, http.StatusInternalServerError, map[string]interface{}{
@@ -5951,6 +5972,7 @@ func (s *server) AddUser() http.HandlerFunc {
 			"proxy_config": proxyConfig,
 			"s3_config":    s3Config,
 			"hmac_key":     user.HmacKey != "",
+			"instance":     user.Instance,
 		}
 		s.respondWithJSON(w, http.StatusCreated, map[string]interface{}{
 			"code":    http.StatusCreated,

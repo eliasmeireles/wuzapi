@@ -86,7 +86,28 @@ var migrations = []Migration{
 		Name:  "repair_webhook_use_proxy",
 		UpSQL: repairWebhookUseProxySQL,
 	},
+	{
+		ID:    13,
+		Name:  "add_instance",
+		UpSQL: addInstanceSQL,
+	},
 }
+
+const addInstanceSQL = `
+-- PostgreSQL version - assigns each user to a wuzapi instance.
+-- Several instances share this database and boot together, so the usual
+-- "IF NOT EXISTS then ALTER" is not enough: both see the column missing and
+-- one of them loses the race. Catching duplicate_column makes it idempotent
+-- under concurrency instead of only in sequence.
+DO $$
+BEGIN
+    ALTER TABLE users ADD COLUMN instance TEXT NOT NULL DEFAULT '';
+EXCEPTION
+    WHEN duplicate_column THEN NULL;
+END $$;
+
+-- SQLite version (handled in code)
+`
 
 const changeIDToStringSQL = `
 -- Migration to change ID from integer to random string
@@ -528,6 +549,12 @@ func applyMigration(db *sqlx.DB, migration Migration) error {
 		} else {
 			_, err = tx.Exec(migration.UpSQL)
 		}
+	} else if migration.ID == 13 {
+		if db.DriverName() == "sqlite" {
+			err = addColumnIfNotExistsSQLite(tx, "users", "instance", "TEXT NOT NULL DEFAULT ''")
+		} else {
+			_, err = tx.Exec(migration.UpSQL)
+		}
 	} else {
 		_, err = tx.Exec(migration.UpSQL)
 	}
@@ -536,10 +563,18 @@ func applyMigration(db *sqlx.DB, migration Migration) error {
 		return fmt.Errorf("failed to execute migration SQL: %w", err)
 	}
 
-	// Record the migration
-	if _, err = tx.Exec(`
+	// Record the migration. Instances sharing a database boot together and can
+	// apply the same migration at the same time; the loser must find the row
+	// already there rather than die on the primary key.
+	insertMigration := `
         INSERT INTO migrations (id, name) 
-        VALUES ($1, $2)`, migration.ID, migration.Name); err != nil {
+        VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`
+	if db.DriverName() == "sqlite" {
+		insertMigration = `
+        INSERT OR IGNORE INTO migrations (id, name) 
+        VALUES ($1, $2)`
+	}
+	if _, err = tx.Exec(insertMigration, migration.ID, migration.Name); err != nil {
 		return fmt.Errorf("failed to record migration: %w", err)
 	}
 
